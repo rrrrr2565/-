@@ -1,0 +1,11 @@
+{
+  "version": "1.3",
+  "notes": "Обновление по воздуху (OTA): лаунчер сам проверяет GitHub и обновляется",
+  "files": {
+    "launcher.py": "https://raw.githubusercontent.com/rrrrr2565/-/main/launcher.py",
+    "README.md": "https://raw.githubusercontent.com/rrrrr2565/-/main/README.md",
+    "requirements.txt": "https://raw.githubusercontent.com/rrrrr2565/-/main/requirements.txt",
+    "run.bat": "https://raw.githubusercontent.com/rrrrr2565/-/main/run.bat",
+    "build_exe.bat": "https://raw.githubusercontent.com/rrrrr2565/-/main/build_exe.bat"
+  }
+}
