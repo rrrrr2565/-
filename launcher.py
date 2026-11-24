@@ -3,19 +3,24 @@
 MyLauncher — простой десктопный лаунчер Minecraft
 Стиль: тёмный Minecraft (тёмный фон, зелёная кнопка ИГРАТЬ)
 Функции:
-  - список версий: релизы, снапшоты, Fabric, Forge
+  - список версий: релизы, снапшоты, Fabric, Forge (+ автообновление списка)
   - скачивание и установка выбранной версии
   - запуск игры (оффлайн-вход по нику)
-  - 10 популярных модов с загрузкой с Modrinth
+  - полный каталог модов Modrinth: поиск, пагинация,
+    автоматическая загрузка обязательных зависимостей
+  - улучшенная консоль: время, цвета по типу события,
+    фильтр сообщений, сохранение лога в файл
 """
 
 import os
 import sys
 import json
+import time
 import queue
 import shutil
 import threading
 import subprocess
+from collections import deque
 
 try:
     import requests
@@ -40,7 +45,7 @@ except ImportError:
 # Настройки
 # ----------------------------------------------------------------------------
 APP_NAME = "MyLauncher"
-APP_VERSION = "1.3"
+APP_VERSION = "1.4"
 
 MODRINTH_API = "https://api.modrinth.com/v2"
 MODRINTH_HEADERS = {"User-Agent": f"{APP_NAME}/{APP_VERSION} (Minecraft launcher)"}
@@ -53,19 +58,9 @@ LOCAL_UPDATE_ZIP = "MyLauncher-update.zip"   # если этот файл леж
 UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/rrrrr2565/-/main/version.json"
 # URL можно также вписать в файл update_url.txt рядом с launcher.py — тогда код менять не нужно
 
-# 10 популярных модов (slug на Modrinth + подпись)
-POPULAR_MODS = [
-    ("fabric-api", "Fabric API — обязательная библиотека для Fabric-модов"),
-    ("sodium", "Sodium — сильное ускорение графики"),
-    ("iris", "Iris — поддержка шейдеров"),
-    ("jei", "JEI — просмотр рецептов предметов"),
-    ("lithium", "Lithium — оптимизация физики и логики"),
-    ("modmenu", "Mod Menu — меню установленных модов"),
-    ("appleskin", "AppleSkin — показывает сытость от еды"),
-    ("ferrite-core", "Ferrite Core — экономит память RAM"),
-    ("cloth-config", "Cloth Config — настройки для многих модов"),
-    ("create", "Create — механизмы, конвейеры, автоматы"),
-]
+# Каталог модов берётся живым поиском с Modrinth — новых модов подхватывать не нужно.
+# Количество модов на страницу каталога
+MODS_PAGE_SIZE = 25
 
 # Папка игры: по умолчанию стандартный .minecraft,
 # можно положить файл launcher_dir.txt рядом с launcher.py со своим путём.
@@ -123,8 +118,40 @@ def get_offline_uuid(username: str) -> str:
     return str(uuid_mod.UUID(bytes=bytes(b)))
 
 
-def fetch_mod_file(slug: str, mc_version: str, loader: str):
-    """Возвращает (имя файла, url) последней совместимой версии мода или None."""
+def search_mods(query: str, mc_version: str, loader: str,
+                offset: int = 0, limit: int = MODS_PAGE_SIZE,
+                use_version_filter: bool = True):
+    """Живой поиск по каталогу Modrinth.
+    Возвращает (список хитов, общее число найденного).
+    Хит: {slug, title, description, downloads}."""
+    facets = [["project_type:mod"], [f"categories:{loader}"]]
+    if use_version_filter:
+        facets.append([f"versions:{mc_version}"])
+    params = {
+        "limit": limit,
+        "offset": offset,
+        "index": "relevance" if query else "downloads",
+        "facets": json.dumps(facets),
+    }
+    if query:
+        params["query"] = query
+    r = requests.get(f"{MODRINTH_API}/search", params=params,
+                     headers=MODRINTH_HEADERS, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    hits = [{
+        "slug": h.get("slug") or h.get("project_id"),
+        "title": h.get("title", ""),
+        "description": h.get("description", ""),
+        "downloads": h.get("downloads", 0),
+    } for h in data.get("hits", [])]
+    return hits, int(data.get("total_hits", 0))
+
+
+def resolve_mod_version(slug: str, mc_version: str, loader: str):
+    """Последняя совместимая версия мода.
+    Возвращает dict {filename, url, deps} или None, если версии нет.
+    deps — project_id обязательных зависимостей."""
     r = requests.get(
         f"{MODRINTH_API}/project/{slug}/version",
         params={
@@ -138,13 +165,68 @@ def fetch_mod_file(slug: str, mc_version: str, loader: str):
     versions = r.json()
     if not versions:
         return None
-    for f in versions[0].get("files", []):
+    v = versions[0]
+    files = v.get("files", [])
+    primary = None
+    for f in files:
         if f.get("primary"):
-            return f["filename"], f["url"]
-    files = versions[0].get("files", [])
-    if files:
-        return files[0]["filename"], files[0]["url"]
-    return None
+            primary = f
+            break
+    if primary is None and files:
+        primary = files[0]
+    if primary is None:
+        return None
+    deps = [d["project_id"] for d in v.get("dependencies", [])
+            if d.get("dependency_type") == "required" and d.get("project_id")]
+    return {"filename": primary["filename"], "url": primary["url"], "deps": deps}
+
+
+def get_project_title(pid_or_slug: str) -> str:
+    """Человекочитаемое название мода по slug или project_id."""
+    try:
+        r = requests.get(f"{MODRINTH_API}/project/{pid_or_slug}",
+                         headers=MODRINTH_HEADERS, timeout=20)
+        r.raise_for_status()
+        return r.json().get("title") or pid_or_slug
+    except Exception:
+        return pid_or_slug
+
+
+def collect_mods_with_deps(slugs, mc_version: str, loader: str, log_fn=print):
+    """Строит план скачивания: выбранные моды + цепочка обязательных зависимостей.
+    Обходит зависимости в ширину (BFS), дубликаты и циклы отсекает.
+    Возвращает список dict: {slug, title, filename, url, is_dep}."""
+    chosen = set(slugs)
+    plan = []
+    taken_files = set()
+    seen = set()
+    q = deque(slugs)
+    while q:
+        proj = q.popleft()
+        if proj in seen:
+            continue
+        seen.add(proj)
+        info = resolve_mod_version(proj, mc_version, loader)
+        if info is None:
+            log_fn(f"[МОД] {proj}: нет версии для MC {mc_version} ({loader}) — пропускаю")
+            continue
+        if info["filename"] in taken_files:
+            continue
+        taken_files.add(info["filename"])
+        title = get_project_title(proj)
+        kind = "Мод" if proj in chosen else "Зависимость"
+        log_fn(f"[МОД] {kind} {title}: выбран {info['filename']}")
+        plan.append({
+            "slug": proj,
+            "title": title,
+            "filename": info["filename"],
+            "url": info["url"],
+            "is_dep": proj not in chosen,
+        })
+        for dep in info["deps"]:
+            if dep not in seen:
+                q.append(dep)
+    return plan
 
 
 def download_mod_file(url: str, dest_path: str):
@@ -266,7 +348,8 @@ def read_zip_launcher_version(zip_path: str):
 def check_update_source():
     """Ищет доступное обновление. Возвращает dict или None, если всё актуально.
     dict: {"version", "zip_path"} для локального zip либо
-          {"version", "zip_url"} для скачивания по манифесту."""
+          {"version", "files"} для скачивания по манифесту либо
+          {"version", "zip_url"} для скачивания zip по ссылке."""
     # 1) манифест по URL (обновление по воздуху)
     manifest_url = _read_update_manifest_url()
     if manifest_url:
@@ -387,6 +470,17 @@ class LauncherApp(ctk.CTk):
 
     VERSION_TYPES = ["Релизы", "Снапшоты", "Fabric", "Forge"]
 
+    # цвет сообщений в консоли по уровню
+    LOG_LEVEL_COLORS = {
+        "error": "#ff7a7a",
+        "warn": "#ffcc66",
+        "mod": "#c9a2ff",
+        "run": "#8ce68c",
+        "game": "#9aa5b5",
+        "update": "#7cc4ff",
+        "plain": "#b9c8b9",
+    }
+
     def __init__(self):
         super().__init__()
 
@@ -406,6 +500,10 @@ class LauncherApp(ctk.CTk):
         self.installing = False     # идёт установка
         self.game_proc = None       # процесс игры
         self._log_queue = queue.Queue()  # потокобезопасная очередь лога
+        self._log_entries = []      # (уровень, строка) — для фильтра и сохранения
+        self._log_filter = "Все"
+        self._loading_versions = False
+        self._log_file = self._prepare_log_file()
 
         # --- цвета в стиле тёмного Minecraft ---
         self.bg_main = "#15151f"      # почти чёрный с фиолетовым
@@ -499,12 +597,22 @@ class LauncherApp(ctk.CTk):
         self.type_segment.set("Релизы")
         self.type_segment.pack(fill="x", padx=20)
 
-        # Список версий
+        # Список версий (+ кнопка обновления списка — новые версии Minecraft подхватываются сами)
+        ver_row = ctk.CTkFrame(left, fg_color="transparent")
+        ver_row.pack(fill="x", padx=20, pady=(12, 2))
         lbl_ver = ctk.CTkLabel(
-            left, text="Версия",
+            ver_row, text="Версия",
             font=self._font(12), text_color=self.text_dim,
         )
-        lbl_ver.pack(anchor="w", padx=20, pady=(12, 2))
+        lbl_ver.pack(side="left")
+        self.refresh_versions_btn = ctk.CTkButton(
+            ver_row, text="ОБНОВИТЬ СПИСОК", width=130, height=22,
+            fg_color=self.bg_entry, hover_color="#33334a",
+            border_width=1, border_color=self.accent_purple,
+            font=self._font(11),
+            command=self._load_versions_async,
+        )
+        self.refresh_versions_btn.pack(side="right")
 
         self.version_box = ctk.CTkComboBox(
             left,
@@ -593,10 +701,10 @@ class LauncherApp(ctk.CTk):
         )
         self.stop_btn.pack(fill="x", padx=20, pady=(0, 8))
 
-        # Кнопка открытия окна популярных модов
+        # Кнопка открытия каталога модов
         self.mods_btn = ctk.CTkButton(
             left,
-            text="ПОПУЛЯРНЫЕ МОДЫ (10)",
+            text="КАТАЛОГ МОДОВ (MODRINTH)",
             font=self._font(13, "bold"),
             fg_color=self.accent_purple,
             hover_color="#8b70e0",
@@ -622,12 +730,30 @@ class LauncherApp(ctk.CTk):
         self.update_btn.pack(fill="x", padx=20, pady=(0, 16))
 
         # ---------------------------------------------------------- правая часть
+        log_top = ctk.CTkFrame(right, fg_color="transparent")
+        log_top.pack(fill="x", padx=20, pady=(16, 4))
+
         log_title = ctk.CTkLabel(
-            right, text="КОНСОЛЬ",
+            log_top, text="КОНСОЛЬ",
             font=self._font(14, "bold"),
             text_color=self.text_main,
         )
-        log_title.pack(anchor="w", padx=20, pady=(16, 4))
+        log_title.pack(side="left")
+
+        self.log_filter_box = ctk.CTkComboBox(
+            log_top,
+            values=["Все", "Только ошибки", "Ошибки и предупреждения", "Моды и обновления"],
+            width=190, height=24,
+            fg_color=self.bg_entry,
+            button_color=self.accent_purple,
+            button_hover_color="#8b70e0",
+            dropdown_fg_color=self.bg_panel,
+            dropdown_hover_color=self.accent_purple,
+            font=self._font(11),
+            command=self._on_log_filter,
+        )
+        self.log_filter_box.set("Все")
+        self.log_filter_box.pack(side="right")
 
         self.log_box = ctk.CTkTextbox(
             right,
@@ -635,8 +761,27 @@ class LauncherApp(ctk.CTk):
             text_color="#b9c8b9",
             font=ctk.CTkFont(family=self._font_mono, size=12),
         )
-        self.log_box.pack(fill="both", expand=True, padx=20, pady=(0, 12))
+        self.log_box.pack(fill="both", expand=True, padx=20, pady=(0, 6))
         self.log_box.configure(state="disabled")
+        # цветные уровни сообщений внутри лога
+        tk_text = getattr(self.log_box, "_textbox", None)
+        if tk_text is not None:
+            for lvl, color in self.LOG_LEVEL_COLORS.items():
+                tk_text.tag_config(lvl, foreground=color)
+
+        log_btns = ctk.CTkFrame(right, fg_color="transparent")
+        log_btns.pack(fill="x", padx=20, pady=(0, 6))
+        ctk.CTkButton(
+            log_btns, text="СОХРАНИТЬ ЛОГ", width=140, height=26,
+            fg_color=self.bg_entry, hover_color="#33334a",
+            border_width=1, border_color=self.accent_purple,
+            font=self._font(11), command=self._save_log,
+        ).pack(side="left")
+        ctk.CTkButton(
+            log_btns, text="ОЧИСТИТЬ", width=110, height=26,
+            fg_color=self.bg_entry, hover_color="#33334a",
+            font=self._font(11), command=self._clear_log,
+        ).pack(side="right")
 
         # Прогресс установки
         self.status_label = ctk.CTkLabel(
@@ -659,22 +804,99 @@ class LauncherApp(ctk.CTk):
     def _font(self, size: int, weight: str = "normal") -> ctk.CTkFont:
         return ctk.CTkFont(family=self._font_family, size=size, weight=weight)
 
+    @staticmethod
+    def _detect_log_level(text: str) -> str:
+        """Определяет цвет строки лога по метке или содержимому."""
+        t = text.lstrip()
+        if t.startswith("[ОШИБКА]") or "/ERROR]" in t or "Exception in thread" in t:
+            return "error"
+        if t.startswith("[ВНИМАНИЕ]") or "/WARN]" in t or t.startswith("WARNING"):
+            return "warn"
+        if t.startswith("[МОД]"):
+            return "mod"
+        if t.startswith("[ЗАПУСК]") or t.startswith("[УСТАНОВКА]"):
+            return "run"
+        if t.startswith("[ИГРА]"):
+            return "game"
+        if t.startswith(("[ОБНОВЛЕНИЕ]", "[JAVA]", "[ВЕРСИИ]")):
+            return "update"
+        return "plain"
+
+    def _prepare_log_file(self) -> str:
+        """Файл лога рядом с launcher.py; крупный файл ротируется в .old."""
+        path = os.path.join(_launcher_dir(), "launcher.log")
+        try:
+            if os.path.isfile(path) and os.path.getsize(path) > 5 * 1024 * 1024:
+                os.replace(path, path + ".old")
+        except OSError:
+            pass
+        return path
+
     def _log(self, text: str):
-        """Потокобезопасно: кладёт строку в очередь, выводит главный поток."""
-        self._log_queue.put(text)
+        """Потокобезопасно: строка уходит в очередь, файл и историю."""
+        ts = time.strftime("%H:%M:%S")
+        level = self._detect_log_level(text)
+        line = f"[{ts}] {text}"
+        self._log_entries.append((level, line))
+        try:
+            with open(self._log_file, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
+        self._log_queue.put((level, line))
+
+    def _level_matches_filter(self, level: str) -> bool:
+        if self._log_filter == "Только ошибки":
+            return level == "error"
+        if self._log_filter == "Ошибки и предупреждения":
+            return level in ("error", "warn")
+        if self._log_filter == "Моды и обновления":
+            return level in ("mod", "update")
+        return True
+
+    def _insert_log_line(self, level: str, line: str):
+        self.log_box.configure(state="normal")
+        self.log_box.insert("end", line + "\n", level)
+        self.log_box.see("end")
+        self.log_box.configure(state="disabled")
 
     def _poll_log(self):
         """Выгружает очередь лога в консоль (выполняется в главном потоке)."""
         try:
             while True:
-                text = self._log_queue.get_nowait()
-                self.log_box.configure(state="normal")
-                self.log_box.insert("end", text + "\n")
-                self.log_box.see("end")
-                self.log_box.configure(state="disabled")
+                level, line = self._log_queue.get_nowait()
+                if self._level_matches_filter(level):
+                    self._insert_log_line(level, line)
         except queue.Empty:
             pass
         self.after(100, self._poll_log)
+
+    def _on_log_filter(self, value: str):
+        """Перестроить консоль, оставив только выбранный тип сообщений."""
+        self._log_filter = value
+        self.log_box.configure(state="normal")
+        self.log_box.delete("1.0", "end")
+        for level, line in self._log_entries:
+            if self._level_matches_filter(level):
+                self.log_box.insert("end", line + "\n", level)
+        self.log_box.see("end")
+        self.log_box.configure(state="disabled")
+
+    def _save_log(self):
+        path = os.path.join(_launcher_dir(), "launcher_log.txt")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                for _level, line in self._log_entries:
+                    f.write(line + "\n")
+            self._log(f"Лог сохранён: {path}")
+        except OSError as e:
+            self._log(f"[ОШИБКА] Не удалось сохранить лог: {e}")
+
+    def _clear_log(self):
+        self._log_entries = []
+        self.log_box.configure(state="normal")
+        self.log_box.delete("1.0", "end")
+        self.log_box.configure(state="disabled")
 
     def _set_status(self, text: str):
         self.after(0, lambda: self.status_label.configure(text=text))
@@ -691,6 +913,10 @@ class LauncherApp(ctk.CTk):
         threading.Thread(target=self._load_versions, daemon=True).start()
 
     def _load_versions(self):
+        if self._loading_versions:
+            return
+        self._loading_versions = True
+        self.after(0, lambda: self.refresh_versions_btn.configure(state="disabled"))
         self.after(0, lambda: self.version_box.configure(values=["Загрузка..."]))
         try:
             versions = self._fetch_versions(self.version_type)
@@ -700,6 +926,9 @@ class LauncherApp(ctk.CTk):
 
         self.versions = versions
         if versions:
+            self._log(f"[ВЕРСИИ] Загружено {len(versions)} версий ({self.version_type})")
+            if self.version_type == "Релизы":
+                self._check_new_release(versions[0])
             self.after(0, lambda: self.version_box.configure(values=versions))
             self.after(0, lambda: self.version_box.set(versions[0]))
         else:
@@ -707,6 +936,28 @@ class LauncherApp(ctk.CTk):
             self.after(0, lambda: self.version_box.set("Нет данных"))
 
         self._update_installed_label()
+        self._loading_versions = False
+        self.after(0, lambda: self.refresh_versions_btn.configure(state="normal"))
+
+    def _check_new_release(self, latest: str):
+        """Сообщает, если с прошлого запуска вышла новая версия Minecraft.
+        Список версий берётся напрямую с серверов Mojang, поэтому свежие
+        версии появляются в лаунчере автоматически."""
+        marker = os.path.join(_launcher_dir(), "last_mc_version.txt")
+        try:
+            prev = ""
+            if os.path.isfile(marker):
+                with open(marker, "r", encoding="utf-8") as f:
+                    prev = f.read().strip()
+            if prev and prev != latest:
+                self._log(
+                    f"[ВЕРСИИ] Вышла новая версия Minecraft {latest} "
+                    f"(прошлый запуск был на {prev}) — она уже в списке"
+                )
+            with open(marker, "w", encoding="utf-8") as f:
+                f.write(latest)
+        except OSError:
+            pass
 
     def _fetch_versions(self, vtype: str):
         if vtype == "Релизы":
@@ -858,7 +1109,7 @@ class LauncherApp(ctk.CTk):
     def _on_mods(self):
         version = self.version_box.get()
         ctx = get_mod_context(self.version_type, version)
-        ModsWindow(self, ctx, self.mc_dir, self._log)
+        ModCatalog(self, ctx, self.mc_dir, self._log)
 
     # ------------------------------------------------------------ обновления
     def _on_check_updates(self):
@@ -977,22 +1228,28 @@ class UpdateDialog(ctk.CTkToplevel):
 
 
 # ----------------------------------------------------------------------------
-# Окно «Популярные моды» — загрузка с Modrinth
+# Каталог модов Modrinth: живой поиск, пагинация, автозагрузка зависимостей
 # ----------------------------------------------------------------------------
-class ModsWindow(ctk.CTkToplevel):
+class ModCatalog(ctk.CTkToplevel):
 
     def __init__(self, master, ctx, mc_dir, log_fn):
         super().__init__(master)
 
         self.ctx = ctx              # (версия MC, загрузчик) или None
         self.mc_dir = mc_dir
-        # потокобезопасный лог: из потока качания — через after в главный поток
+        # потокобезопасный лог: из рабочего потока — через after в главный
         self.log = lambda msg: self.after(0, lambda: log_fn(msg))
+        self.searching = False
         self.downloading = False
+        self.query = ""
+        self.offset = 0
+        self.total_hits = 0
+        self.slugs_vars = {}        # slug -> BooleanVar (галочка выбора)
+        self.no_version_filter = False
 
-        self.title(f"{APP_NAME} — популярные моды")
-        self.geometry("640x560")
-        self.minsize(560, 480)
+        self.title(f"{APP_NAME} — каталог модов")
+        self.geometry("780x680")
+        self.minsize(660, 540)
         self.configure(fg_color=master.bg_main)
         self.transient(master)
         self.lift()
@@ -1001,6 +1258,12 @@ class ModsWindow(ctk.CTkToplevel):
         fam = master._font_family
         self._font = lambda size, weight="normal": ctk.CTkFont(family=fam, size=size, weight=weight)
 
+        # цвета из главного окна (для строк результатов)
+        self.bg_entry_ref = master.bg_entry
+        self.accent_purple_ref = master.accent_purple
+        self.text_main_ref = master.text_main
+        self.text_dim_ref = master.text_dim
+
         # Шапка с контекстом
         top = ctk.CTkFrame(self, fg_color="transparent")
         top.pack(fill="x", padx=16, pady=(14, 6))
@@ -1008,44 +1271,61 @@ class ModsWindow(ctk.CTkToplevel):
         if ctx:
             mc_version, loader = ctx
             loader_name = "Forge" if loader == "forge" else "Fabric"
-            info = f"Моды для Minecraft {mc_version} ({loader_name}) — папка mods"
+            info = (f"Каталог Modrinth: Minecraft {mc_version} ({loader_name}). "
+                    "Отметьте моды — обязательные зависимости скачаются автоматически.")
         else:
-            info = "Моды доступны для версий Fabric и Forge. Выберите такой тип версии и попробуйте снова."
+            info = ("Каталог доступен для версий Fabric и Forge. "
+                    "Выберите такой тип версии на главном экране и попробуйте снова.")
 
         self.info_label = ctk.CTkLabel(
             top, text=info, font=self._font(12),
             text_color=master.text_main if ctx else "#d8a33a",
-            anchor="w", justify="left", wraplength=600,
+            anchor="w", justify="left", wraplength=720,
         )
         self.info_label.pack(fill="x")
 
-        # Список модов
+        # Строка поиска
+        search_row = ctk.CTkFrame(self, fg_color="transparent")
+        search_row.pack(fill="x", padx=16, pady=(4, 4))
+        search_row.grid_columnconfigure(0, weight=1)
+
+        self.search_entry = ctk.CTkEntry(
+            search_row,
+            placeholder_text="Поиск по каталогу Modrinth (пусто = самые популярные)",
+            fg_color=master.bg_entry, font=self._font(13),
+        )
+        self.search_entry.grid(row=0, column=0, sticky="ew")
+        self.search_entry.bind("<Return>", lambda _e: self._on_search())
+
+        self.search_btn = ctk.CTkButton(
+            search_row, text="НАЙТИ", width=110,
+            fg_color=master.accent_purple, hover_color="#8b70e0",
+            font=self._font(13, "bold"), command=self._on_search,
+        )
+        self.search_btn.grid(row=0, column=1, padx=(8, 0))
+
+        # Результаты
         self.scroll = ctk.CTkScrollableFrame(
             self, fg_color=master.bg_panel, corner_radius=12
         )
         self.scroll.pack(fill="both", expand=True, padx=16, pady=8)
 
-        self.check_vars = []
-        for slug, desc in POPULAR_MODS:
-            row = ctk.CTkFrame(self.scroll, fg_color=master.bg_entry, corner_radius=8)
-            row.pack(fill="x", padx=8, pady=4)
+        self.more_btn = ctk.CTkButton(
+            self, text="", height=32,
+            fg_color=master.bg_entry, hover_color="#33334a",
+            border_width=1, border_color=master.accent_purple,
+            font=self._font(12, "bold"),
+            state="disabled", command=self._load_more,
+        )
+        self.more_btn.pack(fill="x", padx=16, pady=(0, 4))
 
-            var = ctk.BooleanVar(value=bool(ctx))
-            box = ctk.CTkCheckBox(
-                row, text=desc, variable=var, width=520,
-                font=self._font(12),
-                fg_color=master.accent_purple, hover_color="#8b70e0",
-                checkmark_color="#ffffff",
-            )
-            box.pack(anchor="w", padx=10, pady=8)
-            self.check_vars.append((slug, var))
-
-        # Низ: кнопки и статус
+        # Низ: статус и кнопки
         bottom = ctk.CTkFrame(self, fg_color="transparent")
-        bottom.pack(fill="x", padx=16, pady=(6, 14))
+        bottom.pack(fill="x", padx=16, pady=(2, 14))
 
         self.status_label = ctk.CTkLabel(
-            bottom, text="", font=self._font(11), text_color=master.text_dim, anchor="w",
+            bottom, text="", font=self._font(11), text_color=master.text_dim,
+            anchor="w", justify="left", wraplength=720,
         )
         self.status_label.pack(fill="x", pady=(0, 6))
 
@@ -1071,63 +1351,183 @@ class ModsWindow(ctk.CTkToplevel):
         )
         close_btn.pack(side="right")
 
+        if ctx:
+            self.after(300, self._on_search)   # сразу показываем популярные моды
+
+    # -------------------------------------------------------- поиск
+    def _on_search(self):
+        if self.searching or not self.ctx:
+            return
+        self.query = self.search_entry.get().strip()
+        self.offset = 0
+        self._clear_results()
+        self.searching = True
+        self.search_btn.configure(state="disabled", text="ИЩУ...")
+        self.status_label.configure(text="Ищу моды...")
+        threading.Thread(target=self._search_worker, daemon=True).start()
+
+    def _load_more(self):
+        if self.searching or not self.ctx:
+            return
+        self.searching = True
+        self.more_btn.configure(state="disabled", text="ЗАГРУЖАЮ...")
+        threading.Thread(target=self._search_worker, daemon=True).start()
+
+    def _search_worker(self):
+        try:
+            hits, total = search_mods(
+                self.query, self.ctx[0], self.ctx[1], self.offset, MODS_PAGE_SIZE
+            )
+            fallback = False
+            if not hits and self.offset == 0 and not self.no_version_filter:
+                # модов именно под эту версию MC нет — покажем весь каталог загрузчика
+                hits, total = search_mods(
+                    self.query, self.ctx[0], self.ctx[1], 0, MODS_PAGE_SIZE,
+                    use_version_filter=False,
+                )
+                fallback = True
+            self.after(0, lambda: self._search_done(hits, total, fallback))
+        except Exception:
+            self.after(0, self._search_error)
+
+    def _search_done(self, hits, total, fallback):
+        self.searching = False
+        self.search_btn.configure(state="normal", text="НАЙТИ")
+        if fallback:
+            self.no_version_filter = True
+            self.info_label.configure(
+                text=self.info_label.cget("text")
+                + "\nМодов именно для этой версии MC не нашлось — показан весь каталог "
+                  "загрузчика. Перед установкой проверяйте совместимость.",
+                text_color="#d8a33a",
+            )
+        if self.offset == 0:
+            self.total_hits = total
+        for hit in hits:
+            self._add_result_row(hit)
+        self.offset += len(hits)
+        if hits and self.offset < self.total_hits:
+            self.more_btn.configure(
+                state="normal",
+                text=f"ПОКАЗАТЬ ЕЩЁ (найдено {self.total_hits}, показано {self.offset})",
+            )
+        elif hits:
+            self.more_btn.configure(state="disabled", text="ВСЁ ПОКАЗАНО")
+        else:
+            self.more_btn.configure(state="disabled", text="НИЧЕГО НЕ НАЙДЕНО")
+        if hits:
+            self.status_label.configure(
+                text=f"Найдено модов: {self.total_hits}. "
+                     "Отметьте нужные и нажмите «СКАЧАТЬ ВЫБРАННЫЕ».")
+        else:
+            self.status_label.configure(text="Ничего не найдено. Измените запрос или версию.")
+
+    def _search_error(self):
+        self.searching = False
+        self.search_btn.configure(state="normal", text="НАЙТИ")
+        self.more_btn.configure(state="disabled", text="ОШИБКА ПОИСКА")
+        self.status_label.configure(
+            text="Ошибка поиска. Проверьте интернет и попробуйте снова.")
+        self.log("[МОД] Ошибка поиска по каталогу")
+
+    def _clear_results(self):
+        for w in self.scroll.winfo_children():
+            w.destroy()
+        self.slugs_vars = {}
+        self.more_btn.configure(state="disabled", text="")
+
+    def _add_result_row(self, hit):
+        slug = hit["slug"]
+        if not slug or slug in self.slugs_vars:
+            return
+        row = ctk.CTkFrame(self.scroll, fg_color=self.bg_entry_ref, corner_radius=8)
+        row.pack(fill="x", padx=8, pady=4)
+
+        var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            row, text="", variable=var, width=26,
+            fg_color=self.accent_purple_ref, hover_color="#8b70e0",
+            checkmark_color="#ffffff",
+        ).pack(side="left", padx=(10, 6), pady=10)
+
+        info = ctk.CTkFrame(row, fg_color="transparent")
+        info.pack(side="left", fill="both", expand=True, padx=(0, 10), pady=8)
+
+        dl_text = f"{hit['downloads']:,}".replace(",", " ")
+        title_lbl = ctk.CTkLabel(
+            info,
+            text=f"{hit['title']}  ·  {dl_text} скачиваний",
+            font=self._font(13, "bold"),
+            text_color=self.text_main_ref, anchor="w",
+        )
+        title_lbl.pack(fill="x")
+        desc_lbl = ctk.CTkLabel(
+            info, text=hit["description"] or "Без описания",
+            font=self._font(11), text_color=self.text_dim_ref,
+            anchor="w", justify="left", wraplength=580,
+        )
+        desc_lbl.pack(fill="x")
+
+        def _toggle(_event=None, v=var):
+            v.set(not v.get())
+
+        for w in (info, title_lbl, desc_lbl):
+            w.bind("<Button-1>", _toggle)
+
+        self.slugs_vars[slug] = var
+
     # -------------------------------------------------------- скачивание
     def _download_selected(self):
         if self.downloading or not self.ctx:
             return
-        selected = [(slug, var.get()) for slug, var in self.check_vars]
-        chosen = [slug for slug, on in selected if on]
+        chosen = [slug for slug, var in self.slugs_vars.items() if var.get()]
         if not chosen:
             self.status_label.configure(text="Ничего не выбрано")
             return
         self.downloading = True
         self.download_btn.configure(state="disabled", text="СКАЧИВАЮ...")
-        threading.Thread(
-            target=self._download_worker, args=(chosen, self.ctx), daemon=True
-        ).start()
+        threading.Thread(target=self._download_worker, args=(chosen,), daemon=True).start()
 
-    def _download_worker(self, slugs, ctx):
-        mc_version, loader = ctx
+    def _download_worker(self, chosen):
+        mc_version, loader = self.ctx
         mods_dir = os.path.join(self.mc_dir, "mods")
         os.makedirs(mods_dir, exist_ok=True)
 
-        ok, skip, fail = 0, 0, 0
-        total = len(slugs)
-        for i, slug in enumerate(slugs, 1):
-            self.after(0, lambda i=i, t=total, s=slug: self.status_label.configure(
-                text=f"Мод {s}: запрос версии ({i}/{t})..."
-            ))
+        self._status(f"Строю список зависимостей для {len(chosen)} мод(ов)...")
+        try:
+            plan = collect_mods_with_deps(chosen, mc_version, loader, self.log)
+        except Exception as e:
+            self.log(f"[МОД] Ошибка построения списка: {e}")
+            plan = []
+
+        ok = skip = fail = 0
+        for i, item in enumerate(plan, 1):
+            kind = "зависимость" if item["is_dep"] else "мод"
+            self._status(f"Скачиваю {i}/{len(plan)}: {item['filename']} ({kind})")
+            dest = os.path.join(mods_dir, item["filename"])
+            if os.path.isfile(dest):
+                skip += 1
+                self.log(f"[МОД] {item['filename']}: уже скачан, пропускаю")
+                continue
             try:
-                info = fetch_mod_file(slug, mc_version, loader)
-                if info is None:
-                    skip += 1
-                    self.log(f"[МОД] {slug}: нет версии для MC {mc_version} ({loader})")
-                    continue
-                filename, url = info
-                self.after(0, lambda f=filename: self.status_label.configure(
-                    text=f"Скачиваю {f}..."
-                ))
-                dest = os.path.join(mods_dir, filename)
-                if os.path.isfile(dest):
-                    self.log(f"[МОД] {filename}: уже скачан, пропускаю")
-                    ok += 1
-                    continue
-                download_mod_file(url, dest)
+                download_mod_file(item["url"], dest)
                 ok += 1
-                self.log(f"[МОД] {filename}: скачан в mods")
+                self.log(f"[МОД] {item['filename']}: скачан в mods")
             except Exception as e:
                 fail += 1
-                self.log(f"[МОД] {slug}: ошибка — {e}")
+                self.log(f"[МОД] {item['filename']}: ошибка — {e}")
 
         def finish():
             self.status_label.configure(
-                text=f"Готово: скачано {ok}, пропущено {skip}, ошибок {fail}. "
-                     f"Моды появятся в игре после перезапуска Minecraft."
-            )
+                text=f"Готово: скачано {ok}, уже были {skip}, ошибок {fail}. "
+                     "Перезапустите Minecraft, чтобы моды появились.")
             self.download_btn.configure(state="normal", text="СКАЧАТЬ ВЫБРАННЫЕ")
             self.downloading = False
 
         self.after(0, finish)
+
+    def _status(self, text: str):
+        self.after(0, lambda: self.status_label.configure(text=text))
 
 
 def main():
