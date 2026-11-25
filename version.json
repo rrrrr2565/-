@@ -1,6 +1,6 @@
 {
-  "version": "1.4.1",
-  "notes": "Исправления: exe больше не теряет .minecraft и логи (_MEI); авто-загрузка Java от Mojang, если Java нет или старая; старые версии модов удаляются из mods автоматически; служебные файлы в папке launcher_data; нормальная сортировка версий Fabric/Forge",
+  "version": "1.4.2",
+  "notes": "Тихий лог: без двойного времени и повторов (Preparing spawn area ×N); скрыт offline-шум (401, Realms, PDH); честное сообщение при остановке игры кнопкой; короткая строка запуска",
   "files": {
     "launcher.py": "https://raw.githubusercontent.com/rrrrr2565/-/main/launcher.py",
     "README.md": "https://raw.githubusercontent.com/rrrrr2565/-/main/README.md",
