@@ -13,6 +13,7 @@ MyLauncher — простой десктопный лаунчер Minecraft
   - авто-загрузка Java: если системной Java нет или она старая,
     лаунчер сам скачивает официальный рантайм Mojang
   - при установке мода старые версии этого же мода удаляются из mods
+  - тихий лог игры (1.4.2): без двойного времени, спама и offline-шума
 """
 
 import os
@@ -49,7 +50,22 @@ except ImportError:
 # Настройки
 # ----------------------------------------------------------------------------
 APP_NAME = "MyLauncher"
-APP_VERSION = "1.4.1"
+APP_VERSION = "1.4.2"
+
+# Безвредный шум offline-режима: ошибки авторизации/Realms/PDH не крашат игру,
+# поэтому в лог они не попадают (в конце игры пишется только их количество)
+GAME_NOISE_RE = re.compile(
+    r"InvalidCredentialsException"
+    r"|Failed to fetch user properties"
+    r"|Could not authorize you against Realms"
+    r"|RealmsServiceException"
+    r"|Failed to fetch Realms feature flags"
+    r"|Couldn'?t connect to realms"
+    r"|PDH Counter|PDH counter"
+    r"|Win32_PerfRawData"
+    r"|COM exception",
+    re.IGNORECASE,
+)
 
 MODRINTH_API = "https://api.modrinth.com/v2"
 MODRINTH_HEADERS = {"User-Agent": f"{APP_NAME}/{APP_VERSION} (Minecraft launcher)"}
@@ -637,6 +653,7 @@ class LauncherApp(ctk.CTk):
         self.versions = []          # список id версий для текущей вкладки
         self.installing = False     # идёт установка
         self.game_proc = None       # процесс игры
+        self._game_stopped_by_user = False  # игру остановили кнопкой СТОП
         self._log_queue = queue.Queue()  # потокобезопасная очередь лога
         self._log_entries = []      # (уровень, строка) — для фильтра и сохранения
         self._log_filter = "Все"
@@ -1011,6 +1028,54 @@ class LauncherApp(ctk.CTk):
             pass
         self.after(100, self._poll_log)
 
+    # ------------------------------------------------------------ тихий лог игры
+    def _pump_game_output(self, stream):
+        """Читает вывод игры в «тихом режиме» (1.4.2):
+        - не дублирует время: у строк Minecraft уже есть своё [ЧЧ:ММ:СС];
+        - схлопывает повторы: одинаковые подряд строки пишутся один раз с (×N);
+        - скрывает безвредный offline-шум (401, Realms, PDH) — в конце
+          игры пишется только их количество.
+        Выполняется в рабочем потоке запуска."""
+        prev_key = None
+        prev_text = None
+        repeats = 0
+        noise = 0
+        in_trace = False  # внутри стек-трейса скрытого исключения
+
+        def flush():
+            nonlocal prev_key, prev_text, repeats
+            if prev_text is None:
+                return
+            if repeats:
+                self._log(f"{prev_text} (×{repeats + 1})")
+            else:
+                self._log(prev_text)
+            prev_key, prev_text, repeats = None, None, 0
+
+        for raw in stream:
+            line = raw.rstrip()
+            if not line.strip():
+                continue
+            m = re.match(r"^\[\d{2}:\d{2}:\d{2}\]\s*(.*)$", line)
+            text = m.group(1) if m else line
+            if GAME_NOISE_RE.search(text):
+                noise += 1
+                in_trace = True   # давим и стек-трейс под ним
+                continue
+            if in_trace and re.match(r"^\s*(at\s|Caused by:|\.\.\.\s*\d+\s*more)", text):
+                noise += 1
+                continue
+            in_trace = False
+            key = re.sub(r"\d+", "#", text)
+            if key == prev_key:
+                repeats += 1
+                continue
+            flush()
+            prev_key, prev_text = key, text
+        flush()
+        if noise:
+            self._log(f"[ИГРА] Пропущено служебных сообщений offline-режима: {noise}")
+
     def _on_log_filter(self, value: str):
         """Перестроить консоль, оставив только выбранный тип сообщений."""
         self._log_filter = value
@@ -1265,8 +1330,9 @@ class LauncherApp(ctk.CTk):
 
             command = mll.command.get_minecraft_command(version, self.mc_dir, options)
             self._log(f"[ЗАПУСК] Minecraft {version}, игрок: {nick}")
-            self._log("[ЗАПУСК] java " + " ".join(command[1:6]) + " ...")
+            self._log(f"[ЗАПУСК] Java: {os.path.basename(command[0])} ({len(command)} параметров)")
 
+            self._game_stopped_by_user = False
             self.game_proc = subprocess.Popen(
                 command,
                 cwd=self.mc_dir,
@@ -1279,13 +1345,15 @@ class LauncherApp(ctk.CTk):
             self._set_status(f"Игра запущена (процесс {self.game_proc.pid})")
             self.after(0, lambda: self.stop_btn.configure(state="normal"))
 
-            # читаем лог игры в консоль лаунчера
+            # читаем лог игры в консоль лаунчера (тихий режим 1.4.2)
             assert self.game_proc.stdout is not None
-            for line in self.game_proc.stdout:
-                self._log(line.rstrip())
+            self._pump_game_output(self.game_proc.stdout)
 
             code = self.game_proc.wait()
-            self._log(f"[ИГРА] Процесс завершён с кодом {code}")
+            if self._game_stopped_by_user:
+                self._log("[ИГРА] Игра остановлена кнопкой СТОП")
+            else:
+                self._log(f"[ИГРА] Процесс завершён с кодом {code}")
             if code == 0 and year is not None and year < 2013:
                 self._log("[ИГРА] Древние версии часто завершаются сразу после старта.")
                 self._log("[ИГРА] Попробуйте выбрать версию 1.20.1 или новее во вкладке «Релизы».")
@@ -1304,7 +1372,8 @@ class LauncherApp(ctk.CTk):
 
     def _on_stop_game(self):
         if self.game_proc and self.game_proc.poll() is None:
-            self._log("[ИГРА] Принудительное завершение процесса игры")
+            self._log("[ИГРА] Останавливаю игру...")
+            self._game_stopped_by_user = True
             self.game_proc.terminate()
         else:
             self._log("[ИГРА] Игра не запущена")
