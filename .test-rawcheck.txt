@@ -1,0 +1,3 @@
+test line one [mc_version] and [main/INFO]
+test line two [m direct]
+test line three
