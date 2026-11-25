@@ -50,7 +50,7 @@ except ImportError:
 # Настройки
 # ----------------------------------------------------------------------------
 APP_NAME = "MyLauncher"
-APP_VERSION = "1.4.2"
+APP_VERSION = "1.4.3"
 
 # Безвредный шум offline-режима: ошибки авторизации/Realms/PDH не крашат игру,
 # поэтому в лог они не попадают (в конце игры пишется только их количество)
@@ -639,7 +639,16 @@ class LauncherApp(ctk.CTk):
         self._migrated = migrate_old_files()
 
         ctk.set_appearance_mode("dark")
-        ctk.set_default_color_theme("dark-blue")
+        # тема лежит в файле внутри пакета customtkinter; если сборка exe сделана
+        # без --collect-all, файла нет — тогда просто работаем на встроенной теме,
+        # вместо падения с FileNotFoundError на старте (баг 1.4.2/1.4.1)
+        try:
+            ctk.set_default_color_theme("dark-blue")
+        except Exception as theme_err:
+            sys.stderr.write(
+                f"[MyLauncher] Тема dark-blue не найдена ({theme_err}), "
+                f"используется встроенная тема\n"
+            )
 
         self.title(f"{APP_NAME} {APP_VERSION}")
         self.geometry("860x680")
