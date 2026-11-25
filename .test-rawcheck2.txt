@@ -1,0 +1,9 @@
+A: zero em -> X0mY
+B: K -> XKY
+C: 31m -> X31mY
+D: H -> XHY
+E: J -> XJY
+F: s -> XsY
+G: u -> XuY
+H: A -> XAY
+I: 2J -> X2JY
