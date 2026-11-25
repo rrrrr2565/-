@@ -10,9 +10,13 @@ MyLauncher — простой десктопный лаунчер Minecraft
     автоматическая загрузка обязательных зависимостей
   - улучшенная консоль: время, цвета по типу события,
     фильтр сообщений, сохранение лога в файл
+  - авто-загрузка Java: если системной Java нет или она старая,
+    лаунчер сам скачивает официальный рантайм Mojang
+  - при установке мода старые версии этого же мода удаляются из mods
 """
 
 import os
+import re
 import sys
 import json
 import time
@@ -45,7 +49,7 @@ except ImportError:
 # Настройки
 # ----------------------------------------------------------------------------
 APP_NAME = "MyLauncher"
-APP_VERSION = "1.4"
+APP_VERSION = "1.4.1"
 
 MODRINTH_API = "https://api.modrinth.com/v2"
 MODRINTH_HEADERS = {"User-Agent": f"{APP_NAME}/{APP_VERSION} (Minecraft launcher)"}
@@ -56,19 +60,63 @@ UPDATABLE_FILES = ["launcher.py", "README.md", "requirements.txt", "run.bat", "b
 LOCAL_UPDATE_ZIP = "MyLauncher-update.zip"   # если этот файл лежит рядом с launcher.py — обновится из него
 # GitHub-репозиторий обновлений: лаунчер сам проверяет манифест и качает новые файлы
 UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/rrrrr2565/-/main/version.json"
-# URL можно также вписать в файл update_url.txt рядом с launcher.py — тогда код менять не нужно
+# URL можно также вписать в файл update_url.txt в папке launcher_data — код менять не нужно
 
 # Каталог модов берётся живым поиском с Modrinth — новых модов подхватывать не нужно.
 # Количество модов на страницу каталога
 MODS_PAGE_SIZE = 25
 
-# Папка игры: по умолчанию стандартный .minecraft,
-# можно положить файл launcher_dir.txt рядом с launcher.py со своим путём.
-DEFAULT_MC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".minecraft")
+
+def _app_dir() -> str:
+    """Папка самого лаунчера.
+    Для exe (PyInstaller onefile) это папка exe — НЕ временная папка _MEI,
+    которая удаляется при выходе (из-за этого пропадали .minecraft и логи)."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+DATA_DIR_NAME = "launcher_data"
+# Служебные файлы лаунчера храним в подпапке launcher_data,
+# чтобы не захламлять папку программы (логи, маркеры, бэкапы).
+_DATA_FILES = [
+    "launcher.log", "launcher.log.old", "launcher_log.txt",
+    "last_mc_version.txt", "launcher_dir.txt", "update_url.txt",
+    "launcher.py.bak", LOCAL_UPDATE_ZIP, LOCAL_UPDATE_ZIP + ".applied",
+]
+
+# Папка игры: по умолчанию стандартный .minecraft рядом с лаунчером,
+# свой путь можно указать в файле launcher_data/launcher_dir.txt.
+DEFAULT_MC_DIR = os.path.join(_app_dir(), ".minecraft")
+
+
+def _data_dir() -> str:
+    d = os.path.join(_app_dir(), DATA_DIR_NAME)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def migrate_old_files() -> int:
+    """Разово переносит служебные файлы из корня программы в launcher_data."""
+    moved = 0
+    for name in _DATA_FILES:
+        src = os.path.join(_app_dir(), name)
+        if not os.path.isfile(src):
+            continue
+        dst = os.path.join(_data_dir(), name)
+        try:
+            if os.path.isfile(dst):
+                os.remove(src)          # в launcher_data уже свежий — дубликат убираем
+            else:
+                os.replace(src, dst)
+            moved += 1
+        except OSError:
+            pass
+    return moved
 
 
 def get_minecraft_dir() -> str:
-    marker = os.path.join(os.path.dirname(os.path.abspath(__file__)), "launcher_dir.txt")
+    marker = os.path.join(_data_dir(), "launcher_dir.txt")
     if os.path.isfile(marker):
         with open(marker, "r", encoding="utf-8") as f:
             custom = f.read().strip()
@@ -239,6 +287,44 @@ def download_mod_file(url: str, dest_path: str):
                     f.write(chunk)
 
 
+def mod_base_name(filename: str) -> str:
+    """«fabric-api-0.167.0+26.3.jar» -> «fabricapi» (имя мода без версии)."""
+    stem = filename
+    if stem.lower().endswith(".jar"):
+        stem = stem[:-4]
+    # отрезаем версию: всё после первого разделителя, за которым идёт цифра
+    stem = re.split(r"[-_.+]\d", stem, maxsplit=1)[0]
+    return re.sub(r"[^a-z0-9]", "", stem.lower())
+
+
+def remove_old_mod_files(mods_dir: str, slug: str, title: str,
+                         keep_filename: str, log_fn=print) -> int:
+    """Удаляет из mods старые jar того же мода (другие версии),
+    чтобы два одинаковых мода не конфликтовали при запуске игры."""
+    targets = {mod_base_name(slug), mod_base_name(title)}
+    targets.discard("")
+    keep = os.path.basename(keep_filename).lower()
+    removed = 0
+    try:
+        entries = sorted(os.listdir(mods_dir))
+    except OSError:
+        return 0
+    for fn in entries:
+        if not fn.lower().endswith((".jar", ".disabled")):
+            continue
+        if fn.lower() == keep:
+            continue
+        if mod_base_name(fn) in targets:
+            path = os.path.join(mods_dir, fn)
+            try:
+                os.remove(path)
+                removed += 1
+                log_fn(f"[МОД] Удалён старый {fn} (заменён на {keep})")
+            except OSError as e:
+                log_fn(f"[МОД] Не удалось удалить старый {fn}: {e}")
+    return removed
+
+
 def get_mod_context(version_type: str, version: str):
     """Определяет (версия MC, загрузчик) для модов или None, если моды не поставить."""
     if version_type == "Forge" and "-" in version:
@@ -246,6 +332,55 @@ def get_mod_context(version_type: str, version: str):
     if version_type == "Fabric":
         return version, "fabric"
     return None
+
+
+def version_manifest_order() -> dict:
+    """Словарь «id версии -> позиция в манифесте Mojang» (новые — первыми)."""
+    try:
+        return {v["id"]: i for i, v in enumerate(mll.utils.get_version_list())}
+    except Exception:
+        return {}
+
+
+def sort_versions_like_manifest(ids):
+    """Сортирует список версий как в манифесте Mojang (новые сверху).
+    Неизвестные id уходят в конец, сохраняя исходный порядок."""
+    order = version_manifest_order()
+    return sorted(ids, key=lambda v: order.get(v, 10 ** 9))
+
+
+def sort_forge_versions(versions):
+    """Forge «1.20.1-47.2.0»: сначала новые версии MC, потом большие билды."""
+    order = version_manifest_order()
+
+    def key(v):
+        base, _, build = v.partition("-")
+        nums = tuple(int(x) for x in re.findall(r"\d+", build))
+        # минусы: сравнение по убыванию (новый билд выше)
+        return (order.get(base, 10 ** 9), tuple(-n for n in nums))
+
+    return sorted(versions, key=key)
+
+
+def java_major_version(java_path: str):
+    """Мажорная версия Java (8, 17, 21, 25...) или None."""
+    try:
+        out = subprocess.run(
+            [java_path, "-version"], capture_output=True,
+            text=True, timeout=20, errors="replace",
+        )
+        text = (out.stderr or "") + (out.stdout or "")
+        m = re.search(r'version "([^"]+)"', text)
+        if not m:
+            return None
+        parts = m.group(1).split(".")
+        if parts and parts[0] == "1" and len(parts) > 1:
+            parts = parts[1:]          # «1.8.0_392» -> 8
+        if parts and parts[0].isdigit():
+            return int(parts[0])
+        return None
+    except Exception:
+        return None
 
 
 def get_version_release_year(version_id: str):
@@ -310,11 +445,11 @@ def _version_tuple(v: str) -> tuple:
 
 
 def _launcher_dir() -> str:
-    return os.path.dirname(os.path.abspath(__file__))
+    return _app_dir()
 
 
 def _read_update_manifest_url() -> str:
-    url_file = os.path.join(_launcher_dir(), "update_url.txt")
+    url_file = os.path.join(_data_dir(), "update_url.txt")
     if os.path.isfile(url_file):
         with open(url_file, "r", encoding="utf-8") as f:
             url = f.read().strip()
@@ -371,8 +506,8 @@ def check_update_source():
         except Exception:
             pass  # манифест недоступен — считаем, что обновлений нет
 
-    # 2) локальный zip рядом с launcher.py
-    local = os.path.join(_launcher_dir(), LOCAL_UPDATE_ZIP)
+    # 2) локальный zip в папке launcher_data
+    local = os.path.join(_data_dir(), LOCAL_UPDATE_ZIP)
     if os.path.isfile(local):
         ver = read_zip_launcher_version(local)
         if ver and _version_tuple(ver) > _version_tuple(APP_VERSION):
@@ -382,8 +517,8 @@ def check_update_source():
 
 
 def download_update_zip(zip_url: str, log_fn=print) -> str:
-    """Скачивает zip обновления рядом с launcher.py и возвращает путь."""
-    dest = os.path.join(_launcher_dir(), LOCAL_UPDATE_ZIP)
+    """Скачивает zip обновления в папку launcher_data и возвращает путь."""
+    dest = os.path.join(_data_dir(), LOCAL_UPDATE_ZIP)
     log_fn(f"[ОБНОВЛЕНИЕ] Скачиваю {zip_url}")
     with requests.get(zip_url, headers=MODRINTH_HEADERS, stream=True, timeout=180) as r:
         r.raise_for_status()
@@ -399,9 +534,9 @@ def download_update_zip(zip_url: str, log_fn=print) -> str:
 def apply_update_files(files: dict, log_fn=print):
     """Обновление отдельными файлами по URL из манифеста (вариант для GitHub).
     Качает только файлы из списка UPDATABLE_FILES, .minecraft не трогает."""
-    me = os.path.abspath(__file__)
-    if "launcher.py" in files and os.path.isfile(me):
-        shutil.copy2(me, os.path.join(_launcher_dir(), "launcher.py.bak"))
+    me = os.path.join(_app_dir(), "launcher.py")
+    if "launcher.py" in files and not getattr(sys, "frozen", False) and os.path.isfile(me):
+        shutil.copy2(me, os.path.join(_data_dir(), "launcher.py.bak"))
         log_fn("[ОБНОВЛЕНИЕ] Бэкап старого launcher.py сохранён")
 
     updated = 0
@@ -409,7 +544,7 @@ def apply_update_files(files: dict, log_fn=print):
         if fname not in UPDATABLE_FILES:
             log_fn(f"[ОБНОВЛЕНИЕ] Пропущен посторонний файл {fname}")
             continue
-        dest = os.path.join(_launcher_dir(), fname)
+        dest = os.path.join(_app_dir(), fname)
         tmp = dest + ".part"
         with requests.get(url, headers=MODRINTH_HEADERS, stream=True, timeout=120) as r:
             r.raise_for_status()
@@ -438,9 +573,9 @@ def apply_update_zip(zip_path: str, log_fn=print):
                     prefix = n[: -len("launcher.py")]
                     break
 
-        me = os.path.abspath(__file__)
-        if os.path.isfile(me):
-            shutil.copy2(me, os.path.join(_launcher_dir(), "launcher.py.bak"))
+        me = os.path.join(_app_dir(), "launcher.py")
+        if not getattr(sys, "frozen", False) and os.path.isfile(me):
+            shutil.copy2(me, os.path.join(_data_dir(), "launcher.py.bak"))
             log_fn("[ОБНОВЛЕНИЕ] Бэкап старого launcher.py сохранён")
 
         updated = 0
@@ -448,7 +583,7 @@ def apply_update_zip(zip_path: str, log_fn=print):
             member = prefix + fname
             if member in names:
                 data = z.read(member)
-                with open(os.path.join(_launcher_dir(), fname), "wb") as fh:
+                with open(os.path.join(_app_dir(), fname), "wb") as fh:
                     fh.write(data)
                 updated += 1
                 log_fn(f"[ОБНОВЛЕНИЕ] Обновлён файл {fname}")
@@ -483,6 +618,9 @@ class LauncherApp(ctk.CTk):
 
     def __init__(self):
         super().__init__()
+
+        # перенос служебных файлов в launcher_data — до первого обращения к логам
+        self._migrated = migrate_old_files()
 
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("dark-blue")
@@ -798,6 +936,8 @@ class LauncherApp(ctk.CTk):
         self.progress.pack(fill="x", padx=20, pady=(4, 16))
 
         self._log(f"{APP_NAME} {APP_VERSION} запущен")
+        if self._migrated:
+            self._log(f"[ОБНОВЛЕНИЕ] Служебные файлы перенесены в папку {DATA_DIR_NAME}: {self._migrated} шт.")
         self._log(f"Папка игры: {self.mc_dir}")
 
     # ------------------------------------------------------------ утилиты
@@ -823,8 +963,8 @@ class LauncherApp(ctk.CTk):
         return "plain"
 
     def _prepare_log_file(self) -> str:
-        """Файл лога рядом с launcher.py; крупный файл ротируется в .old."""
-        path = os.path.join(_launcher_dir(), "launcher.log")
+        """Файл лога в папке launcher_data; крупный файл ротируется в .old."""
+        path = os.path.join(_data_dir(), "launcher.log")
         try:
             if os.path.isfile(path) and os.path.getsize(path) > 5 * 1024 * 1024:
                 os.replace(path, path + ".old")
@@ -883,7 +1023,7 @@ class LauncherApp(ctk.CTk):
         self.log_box.configure(state="disabled")
 
     def _save_log(self):
-        path = os.path.join(_launcher_dir(), "launcher_log.txt")
+        path = os.path.join(_data_dir(), "launcher_log.txt")
         try:
             with open(path, "w", encoding="utf-8") as f:
                 for _level, line in self._log_entries:
@@ -943,7 +1083,7 @@ class LauncherApp(ctk.CTk):
         """Сообщает, если с прошлого запуска вышла новая версия Minecraft.
         Список версий берётся напрямую с серверов Mojang, поэтому свежие
         версии появляются в лаунчере автоматически."""
-        marker = os.path.join(_launcher_dir(), "last_mc_version.txt")
+        marker = os.path.join(_data_dir(), "last_mc_version.txt")
         try:
             prev = ""
             if os.path.isfile(marker):
@@ -965,10 +1105,10 @@ class LauncherApp(ctk.CTk):
         if vtype == "Снапшоты":
             return [v["id"] for v in mll.utils.get_version_list() if v.get("type") == "snapshot"]
         if vtype == "Fabric":
-            # Fabric: берём стабильные версии Minecraft (последний загрузчик ставится сам)
-            return list(mll.fabric.get_stable_minecraft_versions())
+            # Fabric: стабильные версии Minecraft в порядке новизны (от манифеста Mojang)
+            return sort_versions_like_manifest(mll.fabric.get_stable_minecraft_versions())
         if vtype == "Forge":
-            return mll.forge.list_forge_versions()
+            return sort_forge_versions(mll.forge.list_forge_versions())
         return []
 
     def _update_installed_label(self):
@@ -985,12 +1125,72 @@ class LauncherApp(ctk.CTk):
         if found:
             self.java_entry.delete(0, "end")
             self.java_entry.insert(0, found)
-            self._log(f"[JAVA] Найдено: {found}")
+            major = java_major_version(found)
+            self._log(f"[JAVA] Найдено: {found} (Java {major})" if major else f"[JAVA] Найдено: {found}")
         else:
-            self._log("[JAVA] Java не найдена в PATH. Установите Java 17+ и укажите путь вручную.")
+            self._log("[JAVA] Java не найдена в PATH — не проблема: при запуске игры лаунчер "
+                      "сам скачает официальный рантайм Mojang, либо установите Java с adoptium.net.")
 
     def _get_java_path(self) -> str:
         return self.java_entry.get().strip() or None
+
+    def _ensure_java(self, version: str) -> str:
+        """Возвращает путь к подходящей Java для выбранной версии Minecraft.
+        Если системной Java нет или она слишком старая — скачивает
+        официальный рантайм Mojang в .minecraft/runtime."""
+        custom = self.java_entry.get().strip()
+        if custom:
+            if os.path.isfile(custom) or shutil.which(custom):
+                self._log(f"[JAVA] Использую указанную Java: {custom}")
+                return custom
+            self._log(f"[ВНИМАНИЕ] Указанный путь к Java не найден: {custom} — ищу автоматически")
+
+        # какая Java нужна выбранной версии Minecraft (порядок манифеста)
+        probe = version.split("-")[0]          # Forge: «1.20.1-47.2.0» -> «1.20.1»
+        runtime_name = None
+        req_major = None
+        try:
+            info = mll.runtime.get_version_runtime_information(probe, self.mc_dir)
+            if info:
+                runtime_name = info.get("name")
+                req_major = int(info.get("javaMajorVersion", 0)) or None
+        except Exception:
+            pass
+        if req_major is None:
+            req_major = 8                     # самые старые версии
+
+        sys_java = shutil.which("java")
+        if sys_java:
+            major = java_major_version(sys_java)
+            if major is None:
+                self._log(f"[JAVA] Использую системную Java (версию определить не удалось): {sys_java}")
+                return sys_java
+            if major >= req_major:
+                self._log(f"[JAVA] Системная Java {major} подходит (нужна {req_major}+): {sys_java}")
+                return sys_java
+            self._log(f"[ВНИМАНИЕ] Системная Java {major} слишком старая для {version} (нужна {req_major})")
+
+        # официальная Java от Mojang — скачиваем один раз в .minecraft
+        runtime_name = runtime_name or "java-runtime-delta"
+        try:
+            installed = mll.runtime.get_installed_jvm_runtimes(self.mc_dir)
+            if runtime_name not in installed:
+                self._log(f"[JAVA] Скачиваю официальный рантайм Mojang: {runtime_name} (Java {req_major})...")
+                self._log("[JAVA] Это один раз — файлы сохранятся в .minecraft/runtime")
+                cb = InstallProgress(self._set_status, self._set_progress).build()
+                mll.runtime.install_jvm_runtime(runtime_name, self.mc_dir, callback=cb)
+            jvm = mll.runtime.get_executable_path(runtime_name, self.mc_dir)
+            if jvm:
+                self._log(f"[JAVA] Рантайм Mojang готов: {jvm}")
+                return jvm
+        except Exception as e:
+            self._log(f"[JAVA] Не удалось скачать рантайм Mojang: {e}")
+
+        raise RuntimeError(
+            f"Java не найдена (для {version} нужна Java {req_major}+). "
+            "Установите Java с adoptium.net и нажмите «Найти», "
+            "или укажите путь к java.exe в поле «Путь к Java»."
+        )
 
     # ------------------------------------------------------------ установка и запуск
     def _on_play(self):
@@ -1013,12 +1213,15 @@ class LauncherApp(ctk.CTk):
         try:
             callback = InstallProgress(self._set_status, self._set_progress).build()
 
+            # --- Java: системная или официальный рантайм Mojang ---
+            java = self._ensure_java(version)
+
             # --- установка нужного типа версии ---
             if self.version_type == "Fabric":
                 if not mll.fabric.is_minecraft_version_supported(version):
                     raise RuntimeError(f"Fabric не поддерживает версию {version}")
                 self._log(f"[УСТАНОВКА] Fabric {version}")
-                mll.fabric.install_fabric(version, self.mc_dir, callback=callback)
+                mll.fabric.install_fabric(version, self.mc_dir, callback=callback, java=java)
             elif self.version_type == "Forge":
                 if not mll.forge.is_forge_version_valid(version):
                     raise RuntimeError(f"Версия Forge {version} не найдена")
@@ -1027,7 +1230,7 @@ class LauncherApp(ctk.CTk):
                         f"Forge {version} слишком старый: требуется ручная установка установщиком Forge"
                     )
                 self._log(f"[УСТАНОВКА] Forge {version}")
-                mll.forge.install_forge_version(version, self.mc_dir, callback=callback)
+                mll.forge.install_forge_version(version, self.mc_dir, callback=callback, java=java)
             else:
                 # install_minecraft_version также проверяет и чинит существующую установку
                 self._log(f"[УСТАНОВКА] Minecraft {version}")
@@ -1057,10 +1260,8 @@ class LauncherApp(ctk.CTk):
                 "token": "",
                 "launcherName": APP_NAME,
                 "launcherVersion": APP_VERSION,
+                "executablePath": java,
             }
-            java = self._get_java_path()
-            if java:
-                options["executablePath"] = java
 
             command = mll.command.get_minecraft_command(version, self.mc_dir, options)
             self._log(f"[ЗАПУСК] Minecraft {version}, игрок: {nick}")
@@ -1091,6 +1292,9 @@ class LauncherApp(ctk.CTk):
 
         except Exception as e:
             self._log(f"[ОШИБКА] {e}")
+            if "WinError 2" in str(e) or "The system cannot find the file" in str(e):
+                self._log("[ВНИМАНИЕ] Файл не найден — обычно это java.exe. "
+                          "Установите Java 21+ (adoptium.net) или укажите путь в поле «Путь к Java».")
             self._set_status(f"Ошибка: {e}")
             self._set_progress(0)
         finally:
@@ -1500,11 +1704,18 @@ class ModCatalog(ctk.CTkToplevel):
             self.log(f"[МОД] Ошибка построения списка: {e}")
             plan = []
 
-        ok = skip = fail = 0
+        ok = skip = fail = replaced = 0
         for i, item in enumerate(plan, 1):
             kind = "зависимость" if item["is_dep"] else "мод"
             self._status(f"Скачиваю {i}/{len(plan)}: {item['filename']} ({kind})")
             dest = os.path.join(mods_dir, item["filename"])
+            # убираем другие версии этого же мода — они конфликтуют при запуске
+            try:
+                replaced += remove_old_mod_files(
+                    mods_dir, item["slug"], item["title"], item["filename"], self.log
+                )
+            except Exception as e:
+                self.log(f"[МОД] Не удалось проверить старые версии: {e}")
             if os.path.isfile(dest):
                 skip += 1
                 self.log(f"[МОД] {item['filename']}: уже скачан, пропускаю")
@@ -1518,8 +1729,9 @@ class ModCatalog(ctk.CTkToplevel):
                 self.log(f"[МОД] {item['filename']}: ошибка — {e}")
 
         def finish():
+            extra = f", старых версий модов удалено {replaced}" if replaced else ""
             self.status_label.configure(
-                text=f"Готово: скачано {ok}, уже были {skip}, ошибок {fail}. "
+                text=f"Готово: скачано {ok}, уже были {skip}, ошибок {fail}{extra}. "
                      "Перезапустите Minecraft, чтобы моды появились.")
             self.download_btn.configure(state="normal", text="СКАЧАТЬ ВЫБРАННЫЕ")
             self.downloading = False
